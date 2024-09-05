@@ -1,0 +1,2 @@
+This folder contains the SSA cross walk files to aggregate the census tracts into statistical small areas, or SSA's, as was done for Bexar Data Dive. 
+It includes Excel and CSV files for 2010 and 2020 census tract conversions to SSAs.
