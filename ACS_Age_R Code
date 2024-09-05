@@ -1,0 +1,1118 @@
+Use `params` in the YAML to set either the year or range of years of data you would like to pull. 
+It is currently set to pull only 2022 data.
+
+If pulling a year range set `yr1` to the lower end of the range, i.e. 2015
+and `yr2` to the higher end of the range, i.e. 2020.
+
+If pulling just a single year, set both `yr1` and `yr2` to the same year.
+
+Zip code data is available starting in 2011. Use `yr.z` to set a separate year.
+
+
+
+This code will use data from B01001, B01001 B-I, and B17001 for age indicators
+
+It will pull ACS 5 Year data using the Census API, calculate estimates at the county, city, council district, ZCTA, SSA, and census tract levels, then reformat it for entry into the developers datasheet.
+
+# Load Data
+```{r load libraries, message=FALSE}
+# load libraries
+library(tidycensus)
+library(tidyverse)
+library(readxl)
+
+#upload SSA crosswalk
+ssa10 <- read_excel('crosswalks/BexarTracts2010_wSSAs.xlsx') %>% 
+  mutate(merge = 2010, GEOID10 = as.character(GEOID10)) %>% 
+  rename(GEOID = GEOID10, NAME = NAMELSAD, SSA = SSA_ID)
+
+ssa20 <- read_excel('crosswalks/Tract_toSSA/BexarTracts2020_wSSAs.xlsx') %>%
+  mutate(merge = 2020, GEOID20 = as.character(GEOID20)) %>% 
+  rename(GEOID = GEOID20, NAME = NAMELSAD20)
+
+ssa <- rbind(ssa10, ssa20) %>% select(-NAME) %>% select(merge, GEOID, SSA)
+
+#upload council district crosswalk
+cd10 <- read.csv('crosswalks/Tract_toCouncilDistrict/BexarTract2010_CouncilDistricts.csv') %>% 
+  mutate(merge = 2010, GEOID2010 = as.character(GEOID2010)) %>% 
+  rename(GEOID = GEOID2010, CD = CouncilDistrict)
+
+cd20 <- read.csv('crosswalks/Tract_toCouncilDistrict/BexarTract2020_CouncilDistricts.csv') %>%
+  mutate(merge = 2020, GEOID20 = as.character(GEOID20)) %>% 
+  rename(GEOID = GEOID20, CD = CouncilDistrict) %>% 
+  select(-SSA)
+
+cd <- rbind(cd10, cd20) %>% select(merge, GEOID, CD)
+
+# If pulling data for zipcodes, you'll need a list of zipcodes you want to filter for
+# This is an example file path
+zcta <- read.csv("crosswalks/ZipsList.csv") 
+zcta <- zcta$GEOID
+
+rm(ssa10, ssa20, cd10, cd20, path2)
+```
+
+# Data pull functions
+```{r}
+# Function to pull data for multiple years and geographies
+pull <- function(yr, geo, table, out){
+  if (geo == "place"){
+    satx <- get_acs(
+      geography = geo, 
+      state = "TX", 
+      county = NULL,
+      year = yr,
+      survey = "acs5",
+      table = table,
+      output = out,
+      cache_table = T) %>% 
+      filter(GEOID == "4865000")
+  } else {
+    satx <- get_acs(
+      geography = geo, 
+      state = "TX", 
+      county = "Bexar",
+      year = yr,
+      survey = "acs5",
+      table = table,
+      output = out,
+      cache_table = T)
+  }
+}
+
+# Function to pull data at zcta level
+pull.zcta <- function(table) {
+  years.z <- c(params$yr.z:params$yr2)
+  names(years.z) <- years.z
+  
+  trend <- map_dfr(
+    years.z,
+    ~ get_acs(
+      geography = "zcta",
+      table = table,
+      year = .x,
+      survey = "acs5",
+      output = "wide",
+      cache_table = T),
+    .id = "year_"
+  ) %>%
+    mutate(
+      # 2011 and 2012 ZCTA GEOID includes a 48 before, so needs to be removed to properly filter Bexar County zctas
+      GEOID = if_else(year_ %in% c("2011", "2012"), substr(GEOID, 3, 7), GEOID),
+      GEOID = as.numeric(GEOID)) %>%
+    filter(GEOID %in% zcta)
+}
+```
+
+```{r objects we need}
+# Creating an object for years
+yrs <- params$yr1:params$yr2
+
+# Adding names to the years to they come out as years and not sequential numbers
+names(yrs) <- yrs
+
+# Listing geos we'll need
+geos <- c("county", "place", "tract")
+
+# Putting yrs and geos together to make a lil' dataset to use in the `pull` function
+yrs_geos <- expand_grid(yrs, geos)
+
+rm(geos)
+```
+
+# Reshape Functions
+## SSA
+```{r reshape ssa function}
+# Function to recalculate estimates and moes for SSAs
+ssa.calc <- function(df) {
+  df1 <- df %>%
+    mutate(merge = if_else(year_ < "2020", 2010, 2020)) 
+  
+  df1 <- df1 %>%
+    left_join(ssa, by = c("merge" = "merge", "GEOID" = "GEOID")) %>%
+    select(year_, SSA, variable, estimate, moe) %>%
+    group_by(year_, SSA, variable) %>%
+    summarise(sum_est = sum(estimate),
+              sum_moe = moe_sum(moe, estimate)) %>%
+    ungroup()
+  
+  
+  value.ssa <- df1 %>%
+    select(-sum_moe) %>%
+    mutate(variable = paste0(variable, 'E')) %>%
+    pivot_wider(names_from = variable,
+                values_from = sum_est)
+  
+  moe.ssa <- df1 %>%
+    select(-sum_est) %>%
+    mutate(variable = paste0(variable, 'M')) %>%
+    pivot_wider(names_from = variable,
+                values_from = sum_moe)
+  
+  trend.ssa <-
+    left_join(value.ssa, moe.ssa) %>% rename(GEOID = SSA) %>%
+    mutate(NAME = paste0("SSA ", GEOID)) %>%
+    select(year_, GEOID, NAME, everything())
+} 
+```
+
+## Council Districts
+```{r reshape council district function}
+# Function to recalculate estimates and moes for SSAs
+
+cd.calc <- function(df) {
+  df1 <- df %>%
+    mutate(merge = if_else(year_ < "2020", 2010, 2020))
+  
+  df1 <- df1 %>%
+    left_join(cd, by = c("merge" = "merge", "GEOID" = "GEOID")) %>%
+    select(year_, CD, variable, estimate, moe) %>%
+    group_by(year_, CD, variable) %>%
+    summarise(sum_est = sum(estimate),
+              sum_moe = moe_sum(moe, estimate)) %>%
+    ungroup()
+  
+  value.cd <- df1 %>%
+    select(-sum_moe) %>%
+    mutate(variable = paste0(variable, 'E')) %>%
+    pivot_wider(names_from = variable,
+                values_from = sum_est)
+  
+  moe.cd <- df1 %>%
+    select(-sum_est) %>%
+    mutate(variable = paste0(variable, 'M')) %>%
+    pivot_wider(names_from = variable,
+                values_from = sum_moe)
+  
+  trend.cd <-
+    left_join(value.cd, moe.cd) %>% rename(GEOID = CD) %>%
+    mutate(NAME = paste0("Council District ", GEOID)) %>%
+    select(year_, GEOID, NAME, everything()) %>%
+    filter(is.na(GEOID) == FALSE)
+} 
+```
+
+# Age Group by sex
+```{r, message=FALSE}
+# Function to calculate population by age. will be re run at each geographic level
+calc <- function(df){
+  
+  # Replacing MOE NA values with 0 to get MOEs
+  df[is.na(df)] <- 0
+  
+  acs.trend1 <- df %>%
+    group_by(year_, GEOID) %>%
+    mutate(
+      # Under 5 ----
+      popUnder5     = sum(B01001_003E, B01001_027E), 
+      popUnder5_moe = sqrt(sum(B01001_003M^2, B01001_027M^2)),
+      popUnder5_pct     = popUnder5/B01001_001E * 100,
+      popUnder5_pct_moe = moe_prop(popUnder5, B01001_001E, popUnder5_moe, B01001_001M) * 100,
+      
+      ## Under 5 by sex ----
+      popUnder5fem_pct     = B01001_027E/B01001_026E * 100,
+      popUnder5fem_pct_moe = moe_prop(B01001_027E, B01001_026E, B01001_027M, B01001_026M) * 100,
+      
+      popUnder5male_pct     = B01001_003E/B01001_002E * 100,
+      popUnder5male_pct_moe = moe_prop(B01001_003E, B01001_002E, B01001_003M, B01001_002M) * 100,
+      
+      # 5 to 17 ----
+	    pop5to17     = sum(B01001_004E, B01001_005E, B01001_006E, 
+	                       B01001_028E, B01001_029E, B01001_030E),
+      pop5to17_moe = sqrt(sum(B01001_004M^2, B01001_005M^2, B01001_006M^2, 
+                              B01001_028M^2, B01001_029M^2, B01001_030M^2)),
+      pop5to17_pct     = pop5to17/B01001_001E * 100,
+      pop5to17_pct_moe = moe_prop(pop5to17, B01001_001E, pop5to17_moe, B01001_001M) * 100,
+      
+      ## 5 to 17 by sex ----
+      pop5to17fem     = sum(B01001_028E, B01001_029E, B01001_030E),
+      pop5to17fem_moe = sqrt(sum(B01001_028M^2, B01001_029M^2, B01001_030M^2)),
+      
+      pop5to17male     = sum(B01001_004E, B01001_005E, B01001_006E),
+      pop5to17male_moe = sqrt(sum(B01001_004M^2, B01001_005M^2, B01001_006M^2)),
+      
+      pop5to17fem_pct     = pop5to17fem/B01001_026E * 100,
+      pop5to17fem_pct_moe = moe_prop(pop5to17fem, B01001_026E, pop5to17fem_moe, B01001_026M) * 100,
+      
+      pop5to17male_pct     = pop5to17male/B01001_002E * 100,
+      pop5to17male_pct_moe = moe_prop(pop5to17male, B01001_002E, pop5to17male_moe, B01001_002M) * 100,
+      
+      # 18 to 34 ----
+	    pop18to34     = sum(B01001_007E, B01001_008E, B01001_009E, B01001_010E, B01001_011E, B01001_012E, 
+	                        B01001_031E, B01001_032E, B01001_033E, B01001_034E, B01001_035E, B01001_036E),
+      pop18to34_moe = sqrt(sum(B01001_007M^2, B01001_008M^2, B01001_009M^2, B01001_010M^2, B01001_011M^2, B01001_012M^2, 
+	                             B01001_031M^2, B01001_032M^2, B01001_033M^2, B01001_034M^2, B01001_035M^2, B01001_036M^2)),
+      pop18to34_pct     = pop18to34/B01001_001E * 100,
+      pop18to34_pct_moe = moe_prop(pop18to34, B01001_001E, pop18to34_moe, B01001_001M) * 100,
+      
+      ## 18 to 34 by sex ----
+      pop18to34fem     = sum(B01001_031E, B01001_032E, B01001_033E, B01001_034E, B01001_035E, B01001_036E),
+      pop18to34fem_moe = sqrt(sum(B01001_031M^2, B01001_032M^2, B01001_033M^2, B01001_034M^2, B01001_035M^2, B01001_036M^2)),
+      
+      pop18to34male     = sum(B01001_007E, B01001_008E, B01001_009E, B01001_010E, B01001_011E, B01001_012E),
+      pop18to34male_moe = sqrt(sum(B01001_007M^2, B01001_008M^2, B01001_009M^2, B01001_010M^2, B01001_011M^2, B01001_012M^2)),
+      
+      pop18to34fem_pct     = pop18to34fem/B01001_026E* 100, 
+      pop18to34fem_pct_moe = moe_prop(pop18to34fem, B01001_026E, pop18to34fem_moe, B01001_026M)* 100, 
+      
+      pop18to34male_pct     = pop18to34male/B01001_002E * 100,
+      pop18to34male_pct_moe = moe_prop(pop18to34male, B01001_002E, pop18to34male_moe, B01001_002M) * 100,
+      
+      # 35 to 64 ----
+	    pop35to64     = sum(B01001_013E, B01001_014E, B01001_015E, B01001_016E, B01001_017E, B01001_018E, B01001_019E, 
+	                        B01001_037E, B01001_038E, B01001_039E, B01001_040E, B01001_041E, B01001_042E, B01001_043E),
+      pop35to64_moe = sqrt(sum(B01001_013M^2, B01001_014M^2, B01001_015M^2, B01001_016M^2, B01001_017M^2, B01001_018M^2, B01001_019M^2, 
+	                             B01001_037M^2, B01001_038M^2, B01001_039M^2, B01001_040M^2, B01001_041M^2, B01001_042M^2, B01001_043M^2)),
+      pop35to64_pct     = pop35to64/B01001_001E * 100, 
+      pop35to64_pct_moe = moe_prop(pop35to64, B01001_001E, pop35to64_moe, B01001_001M) * 100,
+      
+      ## 35 to 64 by sex ----
+      pop35to64fem     = sum(B01001_037E, B01001_038E, B01001_039E, B01001_040E, 
+                             B01001_041E, B01001_042E, B01001_043E),
+      pop35to64fem_moe = sqrt(sum(B01001_037M^2, B01001_038M^2, B01001_039M^2, B01001_040M^2, 
+                                  B01001_041M^2, B01001_042M^2, B01001_043M^2)),
+      
+      pop35to64male     = sum(B01001_013E, B01001_014E, B01001_015E, B01001_016E, 
+                              B01001_017E, B01001_018E, B01001_019E),
+      pop35to64male_moe = sqrt(sum(B01001_013M^2, B01001_014M^2, B01001_015M^2, B01001_016M^2, 
+                                   B01001_017M^2, B01001_018M^2, B01001_019M^2)),
+      
+      pop35to64fem_pct     = pop35to64fem/B01001_026E * 100,
+      pop35to64fem_pct_moe = moe_prop(pop35to64fem, B01001_026E, pop35to64fem_moe, B01001_026M) * 100,
+      
+      pop35to64male_pct     = pop35to64male/B01001_002E * 100,
+      pop35to64male_pct_moe = moe_prop(pop35to64male, B01001_002E, pop35to64male_moe, B01001_002M) * 100,
+      
+      # 65 or over ----
+	    pop65orOver     = sum(B01001_020E, B01001_021E, B01001_022E, B01001_023E, B01001_024E, B01001_025E, 
+	                          B01001_044E, B01001_045E, B01001_046E, B01001_047E, B01001_048E, B01001_049E),
+      pop65orOver_moe = sqrt(sum(B01001_020M^2, B01001_021M^2, B01001_022M^2, B01001_023M^2, B01001_024M^2, B01001_025M^2, 
+	                               B01001_044M^2, B01001_045M^2, B01001_046M^2, B01001_047M^2, B01001_048M^2, B01001_049M^2)),
+      pop65orOver_pct     = pop65orOver/B01001_001E * 100,
+      pop65orOver_pct_moe = moe_prop(pop65orOver, B01001_001E, pop65orOver_moe, B01001_001M) * 100,
+      
+      ## 65 or over by sex ----
+      pop65orOverfem     = sum(B01001_044E, B01001_045E, B01001_046E, B01001_047E, B01001_048E, B01001_049E),
+      pop65orOverfem_moe = sqrt(sum(B01001_044M^2, B01001_045M^2, B01001_046M^2, B01001_047M^2, B01001_048M^2, B01001_049M^2)),
+      
+      pop65orOvermale     = sum(B01001_020E, B01001_021E, B01001_022E, B01001_023E, B01001_024E, B01001_025E),
+      pop65orOvermale_moe = sqrt(sum(B01001_020M^2, B01001_021M^2, B01001_022M^2, B01001_023M^2, B01001_024M^2, B01001_025M^2)),
+      
+      pop65orOverfem_pct     = pop65orOverfem/B01001_026E * 100,
+      pop65orOverfem_pct_moe = moe_prop(pop65orOverfem, B01001_026E, pop65orOverfem_moe, B01001_026M) * 100, 
+      
+      pop65orOvermale_pct     = pop65orOvermale/B01001_002E * 100,
+      pop65orOvermale_pct_moe = moe_prop(pop65orOvermale, B01001_002E, pop65orOvermale_moe, B01001_002M) * 100
+    ) %>% 
+    
+    # End of calculations and pivot ----
+    # not the most efficient
+  pivot_longer(ends_with("_pct"), 
+               names_to = "label",
+               values_to = "indicator_value") %>%
+  pivot_longer(ends_with("_pct_moe"),
+               names_to = "label2",
+               values_to = "moe") %>%
+  mutate(label2 = gsub("_moe", "", label2)) %>%
+  filter(label == label2) %>%
+  mutate(
+    
+    indicator_id = case_when(
+      str_detect(label, "popUnder5")   ~ 21,
+      str_detect(label, "pop5to17")    ~ 22,
+      str_detect(label, "pop18to34")   ~ 23,
+      str_detect(label, "pop35to64")   ~ 24,
+      str_detect(label, "pop65orOver") ~ 25
+    ),
+    
+    location_id = GEOID,
+    
+    location_type_id = case_when(
+      NAME == "Bexar County, Texas"        ~ 1,
+      NAME == "San Antonio city, Texas"    ~ 6,
+      str_detect(NAME, "Council District") ~ 2, 
+      str_detect(NAME, "ZCTA5")            ~ 3,
+      str_detect(NAME, "SSA")              ~ 4,
+      str_detect(NAME, "Census Tract")     ~ 5
+    ),
+    
+    moe_low  = indicator_value - moe,
+    moe_high = indicator_value + moe,
+    
+    universe_value = case_when(
+      label %in% c("popUnder5_pct", "pop5to17_pct", "pop18to34_pct", "pop35to64_pct", "pop65orOver_pct") ~ B01001_001E,
+      str_detect(label, "male") ~ B01001_002E,
+      str_detect(label, "fem")  ~ B01001_026E
+    ),
+    
+    race_id = NA,
+    age_id  = NA,
+    
+    sex_id = case_when(
+      str_detect(label, "fem")  ~ 200,
+      str_detect(label, "male") ~ 201
+    ),
+    
+    education_id = NA,
+    income_id    = NA,
+    suppress     = NA,
+    
+    count_value = case_when(
+      label == "popUnder5_pct"       ~ popUnder5,
+      label == "popUnder5fem_pct"    ~ B01001_027E,
+      label == "popUnder5male_pct"   ~ B01001_003E,
+      label == "pop5to17_pct"        ~ pop5to17,
+      label == "pop5to17fem_pct"     ~ pop5to17fem,
+      label == "pop5to17male_pct"    ~ pop5to17male,
+      label == "pop18to34_pct"       ~ pop18to34,
+      label == "pop18to34fem_pct"    ~ pop18to34fem,
+      label == "pop18to34male_pct"   ~ pop18to34male,
+      label == "pop35to64_pct"       ~ pop35to64,
+      label == "pop35to64fem_pct"    ~ pop35to64fem,
+      label == "pop35to64male_pct"   ~ pop35to64male,
+      label == "pop65orOver_pct"     ~ pop65orOver,
+      label == "pop65orOverfem_pct"  ~ pop65orOverfem,
+      label == "pop65orOvermale_pct" ~ pop65orOvermale
+    ),
+    
+    universe_moe = case_when(
+      label %in% c("popUnder5_pct", "pop5to17_pct", "pop18to34_pct", "pop35to64_pct", "pop65orOver_pct") ~ B01001_001M,
+      str_detect(label, "male") ~ B01001_002M,
+      str_detect(label, "fem")  ~ B01001_026M
+    ),
+    
+    count_moe = case_when(
+      label == "popUnder5_pct"       ~ popUnder5_moe,
+      label == "popUnder5fem_pct"    ~ B01001_027M,
+      label == "popUnder5male_pct"   ~ B01001_003M,
+      label == "pop5to17_pct"        ~ pop5to17_moe,
+      label == "pop5to17fem_pct"     ~ pop5to17fem_moe,
+      label == "pop5to17male_pct"    ~ pop5to17male_moe,
+      label == "pop18to34_pct"       ~ pop18to34_moe,
+      label == "pop18to34fem_pct"    ~ pop18to34fem_moe,
+      label == "pop18to34male_pct"   ~ pop18to34male_moe,
+      label == "pop35to64_pct"       ~ pop35to64_moe,
+      label == "pop35to64fem_pct"    ~ pop35to64fem_moe,
+      label == "pop35to64male_pct"   ~ pop35to64male_moe,
+      label == "pop65orOver_pct"     ~ pop65orOver_moe,
+      label == "pop65orOverfem_pct"  ~ pop65orOverfem_moe,
+      label == "pop65orOvermale_pct" ~ pop65orOvermale_moe
+    )
+  ) %>%
+  ungroup() %>%
+  select(indicator_id, year_, location_id, location_type_id, indicator_value, moe_low:count_moe) %>%
+  arrange(location_type_id, year_, indicator_id, location_id)
+}
+```
+
+## Pull and calculate data
+```{r load table B01001, message=FALSE}
+# The line of code below will use two functions (a function within a function) to pull table B01001 for county, place, and census tract 
+# for years that are set by the params in the YAML
+trend <- map2_dfr(yrs_geos$yrs, yrs_geos$geos, ~ pull(yr = .x, geo = .y, table = "B01001", out = "wide"), .id = "year_")
+
+# Uses the data pull functions above to pull ACS data using get_acs() for table B01001
+trend.ct   <- map_dfr(yrs, ~ pull(yr = .x, geo = "tract", table = "B01001", out = "tidy"), .id = "year_")
+trend.zcta <- pull.zcta(table = "B01001")
+
+# calculate estimates for council districts and SSA data
+trend.cd   <- cd.calc(trend.ct)
+trend.ssa  <- ssa.calc(trend.ct)
+
+```
+
+```{r run function for all ages, message=FALSE}
+age.all  <- calc(trend)
+age.cd   <- calc(trend.cd)
+age.zcta <- calc(trend.zcta)
+age.ssa  <- calc(trend.ssa)
+
+age <- rbind(age.all, age.cd, age.zcta, age.ssa) %>% 
+  arrange(location_type_id, year_, indicator_id, location_id)
+
+rm(age.all, age.cd, age.zcta, age.ssa, calc)
+```
+
+# Age by Poverty status and sex
+```{r, message=FALSE}
+# Function to calculate population by age. will be re run at each geographic level
+calc.pov <- function(df){
+  
+  acs.trend1 <- df %>%
+    group_by(year_, GEOID) %>%
+    mutate(
+      # Universe ----
+      belowPov     = B17001_002E,
+      belowPov_moe = B17001_002M,
+      
+      belowPovmale     = B17001_003E,
+      belowPovmale_moe = B17001_003M,
+      
+      belowPovfem     = B17001_017E,
+      belowPovfem_moe = B17001_017M,
+      
+      abovePov     = B17001_031E,
+      abovePov_moe = B17001_031M,
+      
+      abovePovmale     = B17001_032E,
+      abovePovmale_moe = B17001_032M,
+      
+      abovePovfem     = B17001_046E,
+      abovePovfem_moe = B17001_046M,
+      
+      # Counts by age and poverty status ----
+      # Under 5 
+      popUnder5belowPov     = sum(B17001_004E, B17001_018E),
+      popUnder5belowPov_moe = sqrt(sum(B17001_004M^2, B17001_018M^2)),
+      
+      popUnder5abovePov = sum(B17001_033E, B17001_047E),
+      popUnder5abovePov_moe = sqrt(sum(B17001_033M^2, B17001_047M^2)),
+      
+      # 5 to 17 
+      pop5to17belowPov     = sum(B17001_005E, B17001_006E, B17001_007E, B17001_008E, B17001_009E,
+	                               B17001_019E, B17001_020E, B17001_021E, B17001_022E, B17001_023E),
+      pop5to17belowPov_moe = sqrt(sum(B17001_005M^2, B17001_006M^2, B17001_007M^2, B17001_008M^2, B17001_009M^2,
+	                                    B17001_019M^2, B17001_020M^2, B17001_021M^2, B17001_022M^2, B17001_023M^2)),
+      
+      pop5to17abovePov     = sum(B17001_034E, B17001_035E, B17001_036E, B17001_037E, B17001_038E,
+	                               B17001_048E, B17001_049E, B17001_050E, B17001_051E, B17001_052E),
+      pop5to17abovePov_moe = sqrt(sum(B17001_034M^2, B17001_035M^2, B17001_036M^2, B17001_037M^2, B17001_038M^2,
+	                                    B17001_048M^2, B17001_049M^2, B17001_050M^2, B17001_051M^2, B17001_052M^2)),
+      
+      # 18 to 34
+      pop18to34belowPov     = sum(B17001_010E, B17001_011E, B17001_024E, B17001_025E),
+      pop18to34belowPov_moe = sqrt(sum(B17001_010M^2, B17001_011M^2, B17001_024M^2, B17001_025M^2)),
+      
+      pop18to34abovePov     = sum(B17001_039E, B17001_040E, B17001_053E, B17001_054E),
+      pop18to34abovePov_moe = sqrt(sum(B17001_039M^2, B17001_040M^2, B17001_053M^2, B17001_054M^2)),
+      
+      # 35 to 64
+      pop35to64belowPov     = sum(B17001_012E, B17001_013E, B17001_014E, B17001_026E, B17001_027E, B17001_028E),
+      pop35to64belowPov_moe = sqrt(sum(B17001_012M^2, B17001_013M^2, B17001_014M^2, B17001_026M^2, B17001_027M^2, B17001_028M^2)),
+      
+      pop35to64abovePov     = sum(B17001_041E, B17001_042E, B17001_043E, B17001_055E, B17001_056E, B17001_057E),
+      pop35to64abovePov_moe = sqrt(sum(B17001_041M^2, B17001_042M^2, B17001_043M^2, B17001_055M^2, B17001_056M^2, B17001_057M^2)),
+      
+      # 65 or over
+      pop65orOverbelowPov     = sum(B17001_015E, B17001_016E, B17001_029E, B17001_030E),
+      pop65orOverbelowPov_moe = sqrt(sum(B17001_015M^2, B17001_016M^2, B17001_029M^2, B17001_030M^2)),
+      
+      pop65orOverabovePov     = sum(B17001_044E, B17001_045E, B17001_058E, B17001_059E),
+      pop65orOverabovePov_moe = sqrt(sum(B17001_044M^2, B17001_045M^2, B17001_058M^2, B17001_059M^2)),
+      
+      # Counts by age, poverty status, and sex 
+      ## Females ----
+      # Under 5 
+      popUnder5belowPovfem     = B17001_018E,
+      popUnder5belowPovfem_moe = B17001_018M,
+      
+      popUnder5abovePovfem     = B17001_047E,
+      popUnder5abovePovfem_moe = B17001_047M,
+      
+      # 5 to 17 
+      pop5to17belowPovfem     = sum(B17001_019E, B17001_020E, B17001_021E, B17001_022E, B17001_023E),
+      pop5to17belowPovfem_moe = sqrt(sum(B17001_019M^2, B17001_020M^2, B17001_021M^2, B17001_022M^2, B17001_023M^2)),
+      
+      pop5to17abovePovfem     = sum(B17001_048E, B17001_049E, B17001_050E, B17001_051E, B17001_052E),
+      pop5to17abovePovfem_moe = sqrt(sum(B17001_048M^2, B17001_049M^2, B17001_050M^2, B17001_051M^2, B17001_052M^2)),
+      
+      # 18 to 34 
+      pop18to34belowPovfem     = sum(B17001_024E, B17001_025E),
+      pop18to34belowPovfem_moe = sqrt(sum(B17001_024M^2, B17001_025M^2)),
+      
+      pop18to34abovePovfem     = sum(B17001_053E, B17001_054E),
+      pop18to34abovePovfem_moe = sqrt(sum(B17001_053M^2, B17001_054M^2)),
+      
+      # 35 to 64 
+      pop35to64belowPovfem     = sum(B17001_026E, B17001_027E, B17001_028E),
+      pop35to64belowPovfem_moe = sqrt(sum(B17001_026M^2, B17001_027M^2, B17001_028M^2)),
+      
+      pop35to64abovePovfem     = sum(B17001_055E, B17001_056E, B17001_057E),
+      pop35to64abovePovfem_moe = sqrt(sum(B17001_055M^2, B17001_056M^2, B17001_057M^2)),
+      
+      # 65 or over
+      pop65orOverbelowPovfem     = sum(B17001_029E, B17001_030E),
+      pop65orOverbelowPovfem_moe = sqrt(sum(B17001_029M^2, B17001_030M^2)),
+      
+      pop65orOverabovePovfem     = sum(B17001_058E, B17001_059E),
+      pop65orOverabovePovfem_moe = sqrt(sum(B17001_058M^2, B17001_059M^2)),
+      
+      ## Males ----
+      # Under 5 
+      popUnder5belowPovmale     = B17001_004E,
+      popUnder5belowPovmale_moe = B17001_004M,
+      
+      popUnder5abovePovmale     = B17001_033E,
+      popUnder5abovePovmale_moe = B17001_033M,
+      
+      # 5 to 17 
+      pop5to17belowPovmale     = sum(B17001_005E, B17001_006E, B17001_007E, B17001_008E, B17001_009E),
+      pop5to17belowPovmale_moe = sqrt(sum(B17001_005M^2, B17001_006M^2, B17001_007M^2, B17001_008M^2, B17001_009M^2)),
+      
+      pop5to17abovePovmale     = sum(B17001_034E, B17001_035E, B17001_036E, B17001_037E, B17001_038E),
+      pop5to17abovePovmale_moe = sqrt(sum(B17001_034M^2, B17001_035M^2, B17001_036M^2, B17001_037M^2, B17001_038M^2)),
+      
+      # 18 to 34 
+      pop18to34belowPovmale     = sum(B17001_010E, B17001_011E),
+      pop18to34belowPovmale_moe = sqrt(sum(B17001_010M^2, B17001_011M^2)),
+      
+      pop18to34abovePovmale     = sum(B17001_039E, B17001_040E),
+      pop18to34abovePovmale_moe = sqrt(sum(B17001_039M^2, B17001_040M^2)),
+      
+      # 35 to 64 
+      pop35to64belowPovmale     = sum(B17001_012E, B17001_013E, B17001_014E),
+      pop35to64belowPovmale_moe = sqrt(sum(B17001_012M^2, B17001_013M^2, B17001_014M^2)),
+      
+      pop35to64abovePovmale     = sum(B17001_041E, B17001_042E, B17001_043E),
+      pop35to64abovePovmale_moe = sqrt(sum(B17001_041M^2, B17001_042M^2, B17001_043M^2)),
+      
+      # 65 or over
+      pop65orOverbelowPovmale     = sum(B17001_015E, B17001_016E),
+      pop65orOverbelowPovmale_moe = sqrt(sum(B17001_015M^2, B17001_016M^2)),
+      
+      pop65orOverabovePovmale     = sum(B17001_044E, B17001_045E),
+      pop65orOverabovePovmale_moe = sqrt(sum(B17001_044M^2, B17001_045M^2)),
+      
+      # INDICATOR VALUES ----
+      # Age by poverty status
+      ## Below poverty
+      popUnder5belowPov_pct     = popUnder5belowPov/belowPov * 100,
+      popUnder5belowPov_pct_moe = moe_prop(popUnder5belowPov, belowPov, popUnder5belowPov_moe, belowPov_moe) * 100,
+      
+      pop5to17belowPov_pct     = pop5to17belowPov/belowPov * 100,
+      pop5to17belowPov_pct_moe = moe_prop(pop5to17belowPov, belowPov, pop5to17belowPov_moe, belowPov_moe) * 100,
+      
+      pop18to34belowPov_pct     = pop18to34belowPov/belowPov * 100,
+      pop18to34belowPov_pct_moe = moe_prop(pop18to34belowPov, belowPov, pop18to34belowPov_moe, belowPov_moe) * 100,
+      
+      pop35to64belowPov_pct     = pop35to64belowPov/belowPov * 100,
+      pop35to64belowPov_pct_moe = moe_prop(pop35to64belowPov, belowPov, pop35to64belowPov_moe, belowPov_moe) * 100,
+      
+      pop65orOverbelowPov_pct     = pop65orOverbelowPov/belowPov * 100,
+      pop65orOverbelowPov_pct_moe = moe_prop(pop65orOverbelowPov, belowPov, pop65orOverbelowPov_moe, belowPov_moe) * 100,
+      
+      ## Above Poverty
+      popUnder5abovePov_pct     = popUnder5abovePov/abovePov * 100,
+      popUnder5abovePov_pct_moe = moe_prop(popUnder5abovePov, abovePov, popUnder5abovePov_moe, abovePov_moe) * 100,
+      
+      pop5to17abovePov_pct     = pop5to17abovePov/abovePov * 100,
+      pop5to17abovePov_pct_moe = moe_prop(pop5to17abovePov, abovePov, pop5to17abovePov_moe, abovePov_moe) * 100,
+      
+      pop18to34abovePov_pct     = pop18to34abovePov/abovePov * 100,
+      pop18to34abovePov_pct_moe = moe_prop(pop18to34abovePov, abovePov, pop18to34abovePov_moe, abovePov_moe) * 100,
+      
+      pop35to64abovePov_pct     = pop35to64abovePov/abovePov * 100,
+      pop35to64abovePov_pct_moe = moe_prop(pop35to64abovePov, abovePov, pop35to64abovePov_moe, abovePov_moe) * 100,
+      
+      pop65orOverabovePov_pct     = pop65orOverabovePov/abovePov * 100,
+      pop65orOverabovePov_pct_moe = moe_prop(pop65orOverabovePov, abovePov, pop65orOverabovePov_moe, abovePov_moe) * 100,
+      
+      # Age by poverty status and sex
+      ## Females below poverty
+      popUnder5belowPovfem_pct     = popUnder5belowPovfem/belowPovfem * 100,
+      popUnder5belowPovfem_pct_moe = moe_prop(popUnder5belowPovfem, belowPovfem, popUnder5belowPovfem_moe, belowPovfem_moe) * 100,
+      
+      pop5to17belowPovfem_pct     = pop5to17belowPovfem/belowPovfem * 100,
+      pop5to17belowPovfem_pct_moe = moe_prop(pop5to17belowPovfem, belowPovfem, pop5to17belowPovfem_moe, belowPovfem_moe) * 100,
+      
+      pop18to34belowPovfem_pct     = pop18to34belowPovfem/belowPovfem * 100,
+      pop18to34belowPovfem_pct_moe = moe_prop(pop18to34belowPovfem, belowPovfem, pop18to34belowPovfem_moe, belowPovfem_moe) * 100,
+      
+      pop35to64belowPovfem_pct     = pop35to64belowPovfem/belowPovfem * 100,
+      pop35to64belowPovfem_pct_moe = moe_prop(pop35to64belowPovfem, belowPovfem, pop35to64belowPovfem_moe, belowPovfem_moe) * 100,
+      
+      pop65orOverbelowPovfem_pct     = pop65orOverbelowPovfem/belowPovfem * 100,
+      pop65orOverbelowPovfem_pct_moe = moe_prop(pop65orOverbelowPovfem, belowPovfem, pop65orOverbelowPovfem_moe, belowPovfem_moe) * 100,
+      
+      ## Females above poverty
+      popUnder5abovePovfem_pct     = popUnder5abovePovfem/abovePovfem * 100,
+      popUnder5abovePovfem_pct_moe = moe_prop(popUnder5abovePovfem, abovePovfem, popUnder5abovePovfem_moe, abovePovfem_moe) * 100,
+      
+      pop5to17abovePovfem_pct     = pop5to17abovePovfem/abovePovfem * 100,
+      pop5to17abovePovfem_pct_moe = moe_prop(pop5to17abovePovfem, abovePovfem, pop5to17abovePovfem_moe, abovePovfem_moe) * 100,
+      
+      pop18to34abovePovfem_pct     = pop18to34abovePovfem/abovePovfem * 100,
+      pop18to34abovePovfem_pct_moe = moe_prop(pop18to34abovePovfem, abovePovfem, pop18to34abovePovfem_moe, abovePovfem_moe) * 100,
+      
+      pop35to64abovePovfem_pct     = pop35to64abovePovfem/abovePovfem * 100,
+      pop35to64abovePovfem_pct_moe = moe_prop(pop35to64abovePovfem, abovePovfem, pop35to64abovePovfem_moe, abovePovfem_moe) * 100,
+      
+      pop65orOverabovePovfem_pct     = pop65orOverabovePovfem/abovePovfem * 100,
+      pop65orOverabovePovfem_pct_moe = moe_prop(pop65orOverabovePovfem, abovePovfem, pop65orOverabovePovfem_moe, abovePovfem_moe) * 100,
+      
+      ## Males below poverty
+      popUnder5belowPovmale_pct     = popUnder5belowPovmale/belowPovmale * 100,
+      popUnder5belowPovmale_pct_moe = moe_prop(popUnder5belowPovmale, belowPovmale, popUnder5belowPovmale_moe, belowPovmale_moe) * 100,
+      
+      pop5to17belowPovmale_pct     = pop5to17belowPovmale/belowPovmale * 100,
+      pop5to17belowPovmale_pct_moe = moe_prop(pop5to17belowPovmale, belowPovmale, pop5to17belowPovmale_moe, belowPovmale_moe) * 100,
+      
+      pop18to34belowPovmale_pct     = pop18to34belowPovmale/belowPovmale * 100,
+      pop18to34belowPovmale_pct_moe = moe_prop(pop18to34belowPovmale, belowPovmale, pop18to34belowPovmale_moe, belowPovmale_moe) * 100,
+      
+      pop35to64belowPovmale_pct     = pop35to64belowPovmale/belowPovmale * 100,
+      pop35to64belowPovmale_pct_moe = moe_prop(pop35to64belowPovmale, belowPovmale, pop35to64belowPovmale_moe, belowPovmale_moe) * 100,
+      
+      pop65orOverbelowPovmale_pct     = pop65orOverbelowPovmale/belowPovmale * 100,
+      pop65orOverbelowPovmale_pct_moe = moe_prop(pop65orOverbelowPovmale,     belowPovmale, 
+                                                 pop65orOverbelowPovmale_moe, belowPovmale_moe) * 100,
+      ## Males above poverty
+      popUnder5abovePovmale_pct     = popUnder5abovePovmale/abovePovmale * 100,
+      popUnder5abovePovmale_pct_moe = moe_prop(popUnder5abovePovmale, abovePovmale, popUnder5abovePovmale_moe, abovePovmale_moe) * 100,
+      
+      pop5to17abovePovmale_pct     = pop5to17abovePovmale/abovePovmale * 100,
+      pop5to17abovePovmale_pct_moe = moe_prop(pop5to17abovePovmale, abovePovmale, pop5to17abovePovmale_moe, abovePovmale_moe) * 100,
+      
+      pop18to34abovePovmale_pct     = pop18to34abovePovmale/abovePovmale * 100,
+      pop18to34abovePovmale_pct_moe = moe_prop(pop18to34abovePovmale, abovePovmale, pop18to34abovePovmale_moe, abovePovmale_moe) * 100,
+      
+      pop35to64abovePovmale_pct     = pop35to64abovePovmale/abovePovmale * 100,
+      pop35to64abovePovmale_pct_moe = moe_prop(pop35to64abovePovmale, abovePovmale, pop35to64abovePovmale_moe, abovePovmale_moe) * 100,
+      
+      pop65orOverabovePovmale_pct     = pop65orOverabovePovmale/abovePovmale * 100,
+      pop65orOverabovePovmale_pct_moe = moe_prop(pop65orOverabovePovmale,     abovePovmale, 
+                                                 pop65orOverabovePovmale_moe, abovePovmale_moe) * 100
+    ) %>% 
+    
+  pivot_longer(ends_with("_pct"), 
+               names_to = "label",
+               values_to = "indicator_value") %>%
+  pivot_longer(ends_with("_pct_moe"),
+               names_to = "label2",
+               values_to = "moe") %>%
+  mutate(label2 = gsub("_moe", "", label2)) %>%
+  filter(label == label2) %>%
+  mutate(
+    
+    indicator_id = case_when(
+      str_detect(label, "popUnder5")   ~ 21,
+      str_detect(label, "pop5to17")    ~ 22,
+      str_detect(label, "pop18to34")   ~ 23,
+      str_detect(label, "pop35to64")   ~ 24,
+      str_detect(label, "pop65orOver") ~ 25
+    ),
+    
+    location_id = GEOID,
+    
+    location_type_id = case_when(
+      NAME == "Bexar County, Texas"        ~ 1,
+      NAME == "San Antonio city, Texas"    ~ 6,
+      str_detect(NAME, "Council District") ~ 2, 
+      str_detect(NAME, "ZCTA5")            ~ 3,
+      str_detect(NAME, "SSA")              ~ 4,
+      str_detect(NAME, "Census Tract")     ~ 5
+    ),
+    
+    moe_low  = indicator_value - moe,
+    moe_high = indicator_value + moe,
+    
+    universe_value = case_when(
+      str_detect(label, "belowPov_")    ~ belowPov,
+      str_detect(label, "abovePov_")    ~ abovePov,
+      str_detect(label, "belowPovfem")  ~ belowPovfem,
+      str_detect(label, "abovePovfem")  ~ abovePovfem,
+      str_detect(label, "belowPovmale") ~ belowPovmale,
+      str_detect(label, "abovePovmale") ~ abovePovmale
+    ),
+    
+    race_id = NA,
+    age_id  = NA,
+    
+    sex_id = case_when(
+      str_detect(label, "fem")  ~ 200,
+      str_detect(label, "male") ~ 201
+    ), 
+    
+    education_id = NA,
+    
+    income_id = case_when(
+      str_detect(label, "belowPov") ~ 500,
+      str_detect(label, "abovePov") ~ 503
+    ),
+    
+    suppress = NA,
+    
+    count_value = case_when(
+      label == "popUnder5belowPov_pct"   ~ popUnder5belowPov,
+      label == "pop5to17belowPov_pct"    ~ pop5to17belowPov,
+      label == "pop18to34belowPov_pct"   ~ pop18to34belowPov,
+      label == "pop35to64belowPov_pct"   ~ pop35to64belowPov,
+      label == "pop65orOverbelowPov_pct" ~ pop65orOverbelowPov,
+      label == "popUnder5abovePov_pct"   ~ popUnder5abovePov,
+      label == "pop5to17abovePov_pct"    ~ pop5to17abovePov,
+      label == "pop18to34abovePov_pct"   ~ pop18to34abovePov,
+      label == "pop35to64abovePov_pct"   ~ pop35to64abovePov,
+      label == "pop65orOverabovePov_pct" ~ pop65orOverabovePov,
+      # Females
+      label == "popUnder5belowPovfem_pct"   ~ popUnder5belowPovfem,
+      label == "pop5to17belowPovfem_pct"    ~ pop5to17belowPovfem,
+      label == "pop18to34belowPovfem_pct"   ~ pop18to34belowPovfem,
+      label == "pop35to64belowPovfem_pct"   ~ pop35to64belowPovfem,
+      label == "pop65orOverbelowPovfem_pct" ~ pop65orOverbelowPovfem,
+      label == "popUnder5abovePovfem_pct"   ~ popUnder5abovePovfem,
+      label == "pop5to17abovePovfem_pct"    ~ pop5to17abovePovfem,
+      label == "pop18to34abovePovfem_pct"   ~ pop18to34abovePovfem,
+      label == "pop35to64abovePovfem_pct"   ~ pop35to64abovePovfem,
+      label == "pop65orOverabovePovfem_pct" ~ pop65orOverabovePovfem,
+      # Males
+      label == "popUnder5belowPovmale_pct"   ~ popUnder5belowPovmale,
+      label == "pop5to17belowPovmale_pct"    ~ pop5to17belowPovmale,
+      label == "pop18to34belowPovmale_pct"   ~ pop18to34belowPovmale,
+      label == "pop35to64belowPovmale_pct"   ~ pop35to64belowPovmale,
+      label == "pop65orOverbelowPovmale_pct" ~ pop65orOverbelowPovmale,
+      label == "popUnder5abovePovmale_pct"   ~ popUnder5abovePovmale,
+      label == "pop5to17abovePovmale_pct"    ~ pop5to17abovePovmale,
+      label == "pop18to34abovePovmale_pct"   ~ pop18to34abovePovmale,
+      label == "pop35to64abovePovmale_pct"   ~ pop35to64abovePovmale,
+      label == "pop65orOverabovePovmale_pct" ~ pop65orOverabovePovmale
+    ),
+    
+    universe_moe = case_when(
+      str_detect(label, "belowPov_")    ~ belowPov_moe,
+      str_detect(label, "abovePov_")    ~ abovePov_moe,
+      str_detect(label, "belowPovfem")  ~ belowPovfem_moe,
+      str_detect(label, "abovePovfem")  ~ abovePovfem_moe,
+      str_detect(label, "belowPovmale") ~ belowPovmale_moe,
+      str_detect(label, "abovePovmale") ~ abovePovmale_moe
+    ),
+    
+    count_moe = case_when(
+      label == "popUnder5belowPov_pct"   ~ popUnder5belowPov_moe,
+      label == "pop5to17belowPov_pct"    ~ pop5to17belowPov_moe,
+      label == "pop18to34belowPov_pct"   ~ pop18to34belowPov_moe,
+      label == "pop35to64belowPov_pct"   ~ pop35to64belowPov_moe,
+      label == "pop65orOverbelowPov_pct" ~ pop65orOverbelowPov_moe,
+      label == "popUnder5abovePov_pct"   ~ popUnder5abovePov_moe,
+      label == "pop5to17abovePov_pct"    ~ pop5to17abovePov_moe,
+      label == "pop18to34abovePov_pct"   ~ pop18to34abovePov_moe,
+      label == "pop35to64abovePov_pct"   ~ pop35to64abovePov_moe,
+      label == "pop65orOverabovePov_pct" ~ pop65orOverabovePov_moe,
+      # Females
+      label == "popUnder5belowPovfem_pct"   ~ popUnder5belowPovfem_moe,
+      label == "pop5to17belowPovfem_pct"    ~ pop5to17belowPovfem_moe,
+      label == "pop18to34belowPovfem_pct"   ~ pop18to34belowPovfem_moe,
+      label == "pop35to64belowPovfem_pct"   ~ pop35to64belowPovfem_moe,
+      label == "pop65orOverbelowPovfem_pct" ~ pop65orOverbelowPovfem_moe,
+      label == "popUnder5abovePovfem_pct"   ~ popUnder5abovePovfem_moe,
+      label == "pop5to17abovePovfem_pct"    ~ pop5to17abovePovfem_moe,
+      label == "pop18to34abovePovfem_pct"   ~ pop18to34abovePovfem_moe,
+      label == "pop35to64abovePovfem_pct"   ~ pop35to64abovePovfem_moe,
+      label == "pop65orOverabovePovfem_pct" ~ pop65orOverabovePovfem_moe,
+      # Males
+      label == "popUnder5belowPovmale_pct"   ~ popUnder5belowPovmale_moe,
+      label == "pop5to17belowPovmale_pct"    ~ pop5to17belowPovmale_moe,
+      label == "pop18to34belowPovmale_pct"   ~ pop18to34belowPovmale_moe,
+      label == "pop35to64belowPovmale_pct"   ~ pop35to64belowPovmale_moe,
+      label == "pop65orOverbelowPovmale_pct" ~ pop65orOverbelowPovmale_moe,
+      label == "popUnder5abovePovmale_pct"   ~ popUnder5abovePovmale_moe,
+      label == "pop5to17abovePovmale_pct"    ~ pop5to17abovePovmale_moe,
+      label == "pop18to34abovePovmale_pct"   ~ pop18to34abovePovmale_moe,
+      label == "pop35to64abovePovmale_pct"   ~ pop35to64abovePovmale_moe,
+      label == "pop65orOverabovePovmale_pct" ~ pop65orOverabovePovmale_moe
+    )
+  ) %>%
+  ungroup() %>%
+  select(indicator_id, year_, location_id, location_type_id, indicator_value, moe_low:count_moe) %>%
+  arrange(location_type_id, year_, indicator_id, location_id)
+}
+```
+
+## Pull and caluclate
+```{r, message=FALSE}
+trend <- map2_dfr(yrs_geos$yrs, yrs_geos$geos, 
+                  ~ pull(yr = .x, geo = .y, table = "B17001", out = "wide"),
+                             .id = "year_")
+
+# Uses the data pull functions above to pull ACS data using get_acs() for table B01001
+trend.ct   <- map_dfr(yrs, ~ pull(yr = .x, geo = "tract", table = "B17001", out = "tidy"), .id = "year_")
+trend.zcta <- pull.zcta(table = "B17001")
+
+# calculate estimates for council districts and SSA data
+trend.cd   <- cd.calc(trend.ct)
+trend.ssa  <- ssa.calc(trend.ct)
+```
+
+```{r run pov by age function, message=FALSE}
+pov.all  <- calc.pov(trend)
+pov.cd   <- calc.pov(trend.cd)
+pov.zcta <- calc.pov(trend.zcta)
+pov.ssa  <- calc.pov(trend.ssa)
+
+age.pov <- rbind(pov.all, pov.cd, pov.zcta, pov.ssa) %>% 
+  arrange(location_type_id, year_)
+
+rm(pov.all, pov.cd, pov.zcta, pov.ssa, trend, trend.cd, trend.zcta, trend.ssa, trend.ct, calc.pov)
+```
+
+# Age by race, and age by race and sex
+```{r age by race, message=FALSE}
+calc.race <- function(df, letter, race_id){
+  
+  df <- df %>%
+    rename_with(~gsub(letter, 'B01001', .x))
+  
+  # Replacing NA values with 0 to get MOEs
+  df[is.na(df)] <- 0
+  
+acs.trend <- df %>%
+  group_by(year_, GEOID) %>%
+  mutate(
+    # Population counts by race and age ----
+    popUnder5     = sum(B01001_003E, B01001_018E),
+    popUnder5_moe = sqrt(sum(B01001_003M^2, B01001_018M^2)),
+    
+    pop5to17     = sum(B01001_004E, B01001_005E, B01001_006E, B01001_019E, B01001_020E, B01001_021E),
+    pop5to17_moe = sqrt(sum(B01001_004M^2, B01001_005M^2, B01001_006M^2, B01001_019M^2, B01001_020M^2, B01001_021M^2)),
+    
+    pop18to34     = sum(B01001_007E, B01001_008E, B01001_009E, B01001_010E,
+                        B01001_022E, B01001_023E, B01001_024E, B01001_025E),
+    pop18to34_moe = sqrt(sum(B01001_007M^2, B01001_008M^2, B01001_009M^2, B01001_010M^2,
+                              B01001_022M^2, B01001_023M^2, B01001_024M^2, B01001_025M^2)),
+    
+    pop35to64     = sum(B01001_011E, B01001_012E, B01001_013E, B01001_026E, B01001_027E, B01001_028E),
+    pop35to64_moe = sqrt(sum(B01001_011M^2, B01001_012M^2, B01001_013M^2, B01001_026M^2, B01001_027M^2, B01001_028M^2)),
+    
+    pop65orOver     = sum(B01001_014E, B01001_015E, B01001_016E, B01001_029E, B01001_030E, B01001_031E),
+    pop65orOver_moe = sqrt(sum(B01001_014M^2, B01001_015M^2, B01001_016M^2, B01001_029M^2, B01001_030M^2, B01001_031M^2)),
+    
+    # INDICATOR: Age with race filter ----
+    popUnder5_pct     = popUnder5/B01001_001E * 100,
+    popUnder5_pct_moe = moe_prop(popUnder5, B01001_001E, popUnder5_moe, B01001_001M) * 100,
+    
+    pop5to17_pct     = pop5to17/B01001_001E * 100,
+    pop5to17_pct_moe = moe_prop(pop5to17, B01001_001E, pop5to17_moe, B01001_001M) * 100,
+    
+    pop18to34_pct     = pop18to34/B01001_001E * 100,
+    pop18to34_pct_moe = moe_prop(pop18to34, B01001_001E, pop18to34_moe, B01001_001M) * 100,
+    
+    pop35to64_pct     = pop35to64/B01001_001E * 100,
+    pop35to64_pct_moe = moe_prop(pop35to64, B01001_001E, pop35to64_moe, B01001_001M) * 100,
+    
+    pop65orOver_pct     = pop65orOver/B01001_001E * 100,
+    pop65orOver_pct_moe = moe_prop(pop65orOver, B01001_001E, pop65orOver_moe, B01001_001M) * 100,
+    
+    # Population counts by age, sex, and race ----
+    ## Female ----
+    popUnder5fem     = B01001_018E,
+    popUnder5fem_moe = B01001_018M^2,
+    
+    pop5to17fem     = sum(B01001_019E, B01001_020E, B01001_021E),
+    pop5to17fem_moe = sqrt(sum(B01001_019M^2, B01001_020M^2, B01001_021M^2)),
+    
+    pop18to34fem     = sum(B01001_022E, B01001_023E, B01001_024E, B01001_025E),
+    pop18to34fem_moe = sqrt(sum(B01001_022M^2, B01001_023M^2, B01001_024M^2, B01001_025M^2)),
+    
+    pop35to64fem     = sum(B01001_026E, B01001_027E, B01001_028E),
+    pop35to64fem_moe = sqrt(sum(B01001_026M^2, B01001_027M^2, B01001_028M^2)),
+    
+    pop65orOverfem     = sum(B01001_029E, B01001_030E, B01001_031E),
+    pop65orOverfem_moe = sqrt(sum(B01001_029M^2, B01001_030M^2, B01001_031M^2)),
+    
+    ## Male ----
+    popUnder5male     = B01001_003E,
+    popUnder5male_moe = B01001_003M,
+    
+    pop5to17male     = sum(B01001_004E, B01001_005E, B01001_006E),
+    pop5to17male_moe = sqrt(sum(B01001_004M^2, B01001_005M^2, B01001_006M^2)),
+    
+    pop18to34male     = sum(B01001_007E, B01001_008E, B01001_009E, B01001_010E),
+    pop18to34male_moe = sqrt(sum(B01001_007M^2, B01001_008M^2, B01001_009M^2, B01001_010M^2)),
+    
+    pop35to64male     = sum(B01001_011E, B01001_012E, B01001_013E),
+    pop35to64male_moe = sqrt(sum(B01001_011M^2, B01001_012M^2, B01001_013M^2)),
+    
+    pop65orOvermale     = sum(B01001_014E, B01001_015E, B01001_016E),
+    pop65orOvermale_moe = sqrt(sum(B01001_014M^2, B01001_015M^2, B01001_016M^2)),
+    
+    # INDICATOR: Age with sex and race filter ----
+    ## Female ----
+    popUnder5fem_pct     = popUnder5fem/B01001_017E * 100,
+    popUnder5fem_pct_moe = moe_prop(popUnder5fem, B01001_017E, popUnder5fem_moe, B01001_017M) * 100,
+    
+    pop5to17fem_pct     = pop5to17fem/B01001_017E * 100,
+    pop5to17fem_pct_moe = moe_prop(pop5to17fem, B01001_017E, pop5to17fem_moe, B01001_017M) * 100,
+    
+    pop18to34fem_pct     = pop18to34fem/B01001_017E * 100,
+    pop18to34fem_pct_moe = moe_prop(pop18to34fem, B01001_017E, pop18to34fem_moe, B01001_017M) * 100,
+    
+    pop35to64fem_pct     = pop35to64fem/B01001_017E * 100,
+    pop35to64fem_pct_moe = moe_prop(pop35to64fem, B01001_017E, pop35to64fem_moe, B01001_017M) * 100,
+    
+    pop65orOverfem_pct     = pop65orOverfem/B01001_017E * 100,
+    pop65orOverfem_pct_moe = moe_prop(pop65orOverfem, B01001_017E, pop65orOverfem_moe, B01001_017M) * 100,
+    
+    ## Male ----
+    popUnder5male_pct     = popUnder5male/B01001_002E * 100,
+    popUnder5male_pct_moe = moe_prop(popUnder5male, B01001_002E, popUnder5male_moe, B01001_002M) * 100,
+    
+    pop5to17male_pct     = pop5to17male/B01001_002E * 100,
+    pop5to17male_pct_moe = moe_prop(pop5to17male, B01001_002E, pop5to17male_moe, B01001_002M) * 100,
+    
+    pop18to34male_pct     = pop18to34male/B01001_002E * 100,
+    pop18to34male_pct_moe = moe_prop(pop18to34male, B01001_002E, pop18to34male_moe, B01001_002M) * 100,
+    
+    pop35to64male_pct     = pop35to64male/B01001_002E * 100,
+    pop35to64male_pct_moe = moe_prop(pop35to64male, B01001_002E, pop35to64male_moe, B01001_002M) * 100,
+    
+    pop65orOvermale_pct     = pop65orOvermale/B01001_002E * 100,
+    pop65orOvermale_pct_moe = moe_prop(pop65orOvermale, B01001_002E, pop65orOvermale_moe, B01001_002M) * 100
+  ) %>% 
+  pivot_longer(ends_with("pct"), 
+               names_to = "label",
+               values_to = "indicator_value") %>%
+  pivot_longer(ends_with("pct_moe"),
+               names_to = "label2",
+               values_to = "moe") %>%
+  mutate(label2 = gsub("_moe", "", label2)) %>%
+  filter(label == label2) %>%
+  # ----
+  mutate(
+    
+    indicator_id = case_when(
+      str_detect(label, "popUnder5")   ~ 21, 
+      str_detect(label, "pop5to17")    ~ 22, 
+      str_detect(label, "pop18to34")   ~ 23, 
+      str_detect(label, "pop35to64")   ~ 24,
+      str_detect(label, "pop65orOver") ~ 25
+    ),
+    
+    location_id = GEOID,
+    
+    location_type_id = case_when(
+      NAME == "Bexar County, Texas"        ~ 1,
+      NAME == "San Antonio city, Texas"    ~ 6,
+      str_detect(NAME, "Council District") ~ 2, 
+      str_detect(NAME, "ZCTA5")            ~ 3,
+      str_detect(NAME, "SSA")              ~ 4,
+      str_detect(NAME, "Census Tract")     ~ 5
+    ),
+    
+    moe_low  = indicator_value - moe,
+    moe_high = indicator_value + moe,
+    
+    universe_value = case_when(
+      label %in% c("popUnder5_pct", "pop5to17_pct", "pop18to34_pct", "pop35to64_pct", "pop65orOver_pct") ~ B01001_001E,
+      str_detect(label, "male") ~ B01001_002E,
+      str_detect(label, "fem")  ~ B01001_017E
+    ),
+    
+    race_id = race_id,
+    age_id  = NA,
+    
+    sex_id = case_when(
+      str_detect(label, "fem")  ~ 200,
+      str_detect(label, "male") ~ 201
+    ),
+    
+    education_id = NA,
+    income_id    = NA,
+    suppress     = NA,
+    
+    count_value = case_when(
+      label == "popUnder5_pct"       ~ popUnder5,
+      label == "popUnder5fem_pct"    ~ popUnder5fem,
+      label == "popUnder5male_pct"   ~ popUnder5male,
+      label == "pop5to17_pct"        ~ pop5to17,
+      label == "pop5to17fem_pct"     ~ pop5to17fem,
+      label == "pop5to17male_pct"    ~ pop5to17male,
+      label == "pop18to34_pct"       ~ pop18to34, 
+      label == "pop18to34fem_pct"    ~ pop18to34fem,
+      label == "pop18to34male_pct"   ~ pop18to34male,  
+      label == "pop35to64_pct"       ~ pop35to64,
+      label == "pop35to64fem_pct"    ~ pop35to64fem,
+      label == "pop35to64male_pct"   ~ pop35to64male, 
+      label == "pop65orOver_pct"     ~ pop65orOver,
+      label == "pop65orOverfem_pct"  ~ pop65orOverfem,
+      label == "pop65orOvermale_pct" ~ pop65orOvermale
+    ),
+    
+    universe_moe = case_when(
+      label %in% c("popUnder5_pct", "pop5to17_pct", "pop18to34_pct", "pop35to64_pct", "pop65orOver_pct") ~ B01001_001M,
+      str_detect(label, "male") ~ B01001_002M,
+      str_detect(label, "fem")  ~ B01001_017M
+    ),
+    
+    count_moe = case_when(
+      label == "popUnder5_pct"       ~ popUnder5_moe,
+      label == "popUnder5fem_pct"    ~ popUnder5fem_moe,
+      label == "popUnder5male_pct"   ~ popUnder5male_moe,
+      label == "pop5to17_pct"        ~ pop5to17_moe,
+      label == "pop5to17fem_pct"     ~ pop5to17fem_moe,
+      label == "pop5to17male_pct"    ~ pop5to17male_moe,
+      label == "pop18to34_pct"       ~ pop18to34_moe, 
+      label == "pop18to34fem_pct"    ~ pop18to34fem_moe,
+      label == "pop18to34male_pct"   ~ pop18to34male_moe,  
+      label == "pop35to64_pct"       ~ pop35to64_moe,
+      label == "pop35to64fem_pct"    ~ pop35to64fem_moe,
+      label == "pop35to64male_pct"   ~ pop35to64male_moe, 
+      label == "pop65orOver_pct"     ~ pop65orOver_moe,
+      label == "pop65orOverfem_pct"  ~ pop65orOverfem_moe,
+      label == "pop65orOvermale_pct" ~ pop65orOvermale_moe
+    )
+  ) %>%
+  ungroup() %>%
+  select(indicator_id, year_, location_id:location_type_id, indicator_value, moe_low:count_moe) %>%
+  arrange(location_type_id, year_, indicator_id, location_id)
+}
+```
+
+```{r}
+# Additional function to pull data and calculate estimates by race
+
+race.pull.calc <- function(table, id){
+  # Pull data
+  trend <- map2_dfr(yrs_geos$yrs, yrs_geos$geos, ~ pull(yr = .x, geo = .y, table = table, out = "wide"), .id = "year_")
+  trend.ct   <- map_dfr(yrs, ~pull(yr = .x, geo = "tract", table = table, out = "tidy"), .id = "year_")
+  trend.cd   <- cd.calc(trend.ct)
+  trend.ssa  <- ssa.calc(trend.ct)
+  trend.zcta <- pull.zcta(table = table)
+  # Calculations
+  race.all  <- calc.race(df = trend,      letter = table, race_id = id)
+  race.cd   <- calc.race(df = trend.cd,   letter = table, race_id = id)
+  race.zcta <- calc.race(df = trend.zcta, letter = table, race_id = id)
+  race.ssa  <- calc.race(df = trend.ssa,  letter = table, race_id = id)
+  # Combine all data objects
+  combined <- rbind(race.all, race.cd, race.zcta, race.ssa) %>% 
+  arrange(location_type_id, indicator_id, year_, location_id)
+}
+```
+
+## Data pulls and calculations by race
+```{r, message=FALSE}
+age.aian  <- race.pull.calc(table = "B01001C", id = 100)
+age.asian <- race.pull.calc(table = "B01001D", id = 101)
+age.black <- race.pull.calc(table = "B01001B", id = 102)
+age.hisp  <- race.pull.calc(table = "B01001I", id = 103)
+age.nhpi  <- race.pull.calc(table = "B01001E", id = 104)
+age.other <- race.pull.calc(table = "B01001F", id = 105)
+age.two   <- race.pull.calc(table = "B01001G", id = 106)
+age.white <- race.pull.calc(table = "B01001H", id = 107)
+
+age.race <- rbind(age.aian, age.asian, age.black, age.hisp, age.nhpi, age.other, age.two, age.white)
+
+rm(age.aian, age.asian, age.black, age.hisp, age.nhpi, age.other, age.two, age.white, 
+   calc.race, race.pull.calc)
+```
+
+# Combine all data and Export
+```{r}
+# Have to split this up into two files
+
+age.ind1 <- rbind(age, age.pov) %>%
+  mutate(
+    moe_low = if_else(moe_low   <   0,   0, moe_low),
+    moe_high = if_else(moe_high > 100, 100, moe_high)
+  ) %>%
+  arrange(location_type_id, indicator_id, year_, location_id)
+
+age.ind2 <- age.race %>%
+  mutate(
+    moe_low = if_else(moe_low   <   0,   0, moe_low),
+    moe_high = if_else(moe_high > 100, 100, moe_high)
+  ) %>%
+  arrange(location_type_id, indicator_id, year_, location_id)
+
+write.csv(age.ind1, file = paste0('output/ACS_Age_allFilters_', yr1, '-', yr2, '_1.csv'), row.names = F, na = "")
+write.csv(age.ind2, file = paste0('output/ACS_Age_allFilters_', yr1, '-', yr2, '_2.csv'), row.names = F, na = "")
+```
+
